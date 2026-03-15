@@ -5,7 +5,6 @@ from langchain.messages import SystemMessage
 from langgraph.graph import StateGraph, START, END, add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 
 load_dotenv()
 
@@ -27,7 +26,6 @@ workflow.add_edge(START, "chat_node")
 workflow.add_edge("chat_node", END)
 
 memory = InMemorySaver()
-# memory = SqliteSaver.from_conn_string("conversations.db")
 app = workflow.compile(checkpointer=memory)
 
 
