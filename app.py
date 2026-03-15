@@ -4,9 +4,10 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain.messages import SystemMessage
 from langgraph.graph import StateGraph, START, END, add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.checkpoint.memory import InMemorySaver
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 
-load_dotenv()
+load_dotenv(override=True)
 
 MODEL_DEFAULT = "gemini-2.5-flash"
 llm = ChatGoogleGenerativeAI(model=MODEL_DEFAULT)
@@ -25,7 +26,8 @@ workflow.add_node("chat_node", chat_node)
 workflow.add_edge(START, "chat_node")
 workflow.add_edge("chat_node", END)
 
-memory = InMemorySaver()
+conn = sqlite3.connect("conversations.db", check_same_thread=False)
+memory = SqliteSaver(conn)
 app = workflow.compile(checkpointer=memory)
 
 
