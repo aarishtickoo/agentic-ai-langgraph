@@ -1,8 +1,29 @@
 import streamlit as st
 from uuid import uuid4
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 from app import app
+
+
+def msg_to_dict(msg):
+    role = "user" if isinstance(msg, HumanMessage) else "assistant"
+    return {"role": role, "content": msg.content}
+
+
+def load_all_threads_from_db():
+    seen = set()
+    threads = []
+    all_messages = {}
+
+    for cp in app.checkpointer.list(None):
+        thread_id = cp.config["configurable"]["thread_id"]
+        if thread_id not in seen:
+            seen.add(thread_id)
+            threads.append(thread_id)
+            raw_messages = cp.checkpoint["channel_values"].get("messages", [])
+            all_messages[thread_id] = [msg_to_dict(m) for m in raw_messages]
+
+    return threads, all_messages
 
 
 def add_to_all_threads(thread_id):
@@ -29,17 +50,26 @@ def load_thread(thread_id):
 
 
 if "all_threads" not in st.session_state:
+    thread_ids, all_messages = load_all_threads_from_db()
+
     st.session_state.all_threads = []
+    st.session_state.all_messages = all_messages
 
-if "all_messages" not in st.session_state:
-    st.session_state.all_messages = {}
-
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid4())
-    add_to_all_threads(st.session_state.thread_id)
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if thread_ids:
+        for i, tid in enumerate(reversed(thread_ids)):
+            st.session_state.all_threads.append({
+                "thread_id": tid,
+                "name": f"Thread {i + 1}"
+            })
+        # load most recent thread as active
+        most_recent = thread_ids[0]
+        st.session_state.thread_id = most_recent
+        st.session_state.messages = all_messages.get(most_recent, [])
+    else:
+        # no db history yet — fresh start
+        st.session_state.thread_id = str(uuid4())
+        st.session_state.messages = []
+        add_to_all_threads(st.session_state.thread_id)
 
 
 st.set_page_config(page_title="LangGraph Chatbot", page_icon="🤖")
@@ -81,7 +111,6 @@ if user_input:
     st.session_state.all_messages[st.session_state.thread_id] = st.session_state.messages
 
 with st.sidebar:
-    # st.markdown(f"### 💬 {next(t['name'] for t in st.session_state.all_threads if t['thread_id'] == st.session_state.thread_id)}")
     if st.button("+ New Conversation"):
         new_thread()
         st.rerun()
