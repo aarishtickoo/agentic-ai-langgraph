@@ -1,7 +1,10 @@
 agentic/
+notebooks/
 __pycache__/
 .env
 .zshrc
 .ipynb_checkpoints/
 .DS_Store
 .vscode/
+*.db
+rough.ipynb

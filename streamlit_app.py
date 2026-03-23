@@ -1,72 +1,62 @@
 import streamlit as st
 from uuid import uuid4
-from langchain_core.messages import HumanMessage, AIMessage
-
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from app import app
 
 
 def msg_to_dict(msg):
+    if isinstance(msg, ToolMessage):
+        return None
+    if isinstance(msg, AIMessage) and (msg.tool_calls or not msg.content):
+        return None
     role = "user" if isinstance(msg, HumanMessage) else "assistant"
-    return {"role": role, "content": msg.content}
-
+    content = msg.content if isinstance(msg.content, str) else "".join(
+        block["text"] for block in msg.content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    return {"role": role, "content": content}
 
 def load_all_threads_from_db():
-    seen = set()
-    threads = []
-    all_messages = {}
+    return list(dict.fromkeys(
+        cp.config["configurable"]["thread_id"]
+        for cp in app.checkpointer.list(None)
+    ))
 
-    for cp in app.checkpointer.list(None):
-        thread_id = cp.config["configurable"]["thread_id"]
-        if thread_id not in seen:
-            seen.add(thread_id)
-            threads.append(thread_id)
-            raw_messages = cp.checkpoint["channel_values"].get("messages", [])
-            all_messages[thread_id] = [msg_to_dict(m) for m in raw_messages]
-
-    return threads, all_messages
-
+def load_messages_from_db(thread_id):
+    config = {"configurable": {"thread_id": thread_id}}
+    state = app.get_state(config)
+    raw_messages = state.values.get("messages", [])
+    return [d for d in (msg_to_dict(m) for m in raw_messages) if d is not None]
 
 def add_to_all_threads(thread_id):
     existing_ids = [t["thread_id"] for t in st.session_state.all_threads]
     if thread_id not in existing_ids:
-        thread_num = len(st.session_state.all_threads) + 1
         st.session_state.all_threads.append({
             "thread_id": thread_id,
-            "name": f"Thread {thread_num}"
+            "name": f"Thread: {thread_id}"
         })
 
-
 def new_thread():
-    st.session_state.all_messages[st.session_state.thread_id] = st.session_state.messages
     st.session_state.thread_id = str(uuid4())
     st.session_state.messages = []
     add_to_all_threads(st.session_state.thread_id)
 
-
 def load_thread(thread_id):
-    st.session_state.all_messages[st.session_state.thread_id] = st.session_state.messages
     st.session_state.thread_id = thread_id
-    st.session_state.messages = st.session_state.all_messages.get(thread_id, [])
+    st.session_state.messages = load_messages_from_db(thread_id)
 
 
 if "all_threads" not in st.session_state:
-    thread_ids, all_messages = load_all_threads_from_db()
-
+    thread_ids = load_all_threads_from_db()
     st.session_state.all_threads = []
-    st.session_state.all_messages = all_messages
 
     if thread_ids:
-        for i, tid in enumerate(reversed(thread_ids)):
-            st.session_state.all_threads.append({
-                "thread_id": tid,
-                "name": f"Thread {i + 1}"
-            })
-        # load most recent thread as active
+        for tid in reversed(thread_ids):
+            add_to_all_threads(tid)
         most_recent = thread_ids[0]
         st.session_state.thread_id = most_recent
-        st.session_state.messages = all_messages.get(most_recent, [])
+        st.session_state.messages = load_messages_from_db(most_recent)
     else:
-        # no db history yet — fresh start
         st.session_state.thread_id = str(uuid4())
         st.session_state.messages = []
         add_to_all_threads(st.session_state.thread_id)
@@ -93,26 +83,39 @@ if user_input:
     }
 
     with st.chat_message("assistant"):
-        placeholder = st.empty()
-        placeholder.status("Thinking...")
+        thinking = st.empty()
+        thinking.status("Thinking...")
+        status_holder = {"box": None}
 
         def stream_response():
-            first_chunk = True
             for chunk, metadata in app.stream(
                 {"messages": [HumanMessage(content=user_input)]},
                 config=config,
-                stream_mode="messages"
+                stream_mode="messages",
             ):
-                if chunk.content:
-                    if first_chunk:
-                        placeholder.empty()
-                        first_chunk = False
-                    yield chunk.content
+                if isinstance(chunk, ToolMessage):
+                    thinking.empty()
+                    tool_name = getattr(chunk, "name", "tool")
+                    if status_holder["box"] is None:
+                        status_holder["box"] = st.status(f"🔧 Using `{tool_name}`", expanded=True)
+                    else:
+                        status_holder["box"].update(label=f"🔧 Using `{tool_name}`", state="running", expanded=True)
+
+                if isinstance(chunk, AIMessage) and chunk.content:
+                    thinking.empty()
+                    content = chunk.content if isinstance(chunk.content, str) else "".join(
+                        block["text"] for block in chunk.content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                    if content:
+                        yield content
 
         ai_content = st.write_stream(stream_response())
 
+        if status_holder["box"] is not None:
+            status_holder["box"].update(label="✅ Tool usage finished", state="complete", expanded=False)
+
     st.session_state.messages.append({"role": "assistant", "content": ai_content})
-    st.session_state.all_messages[st.session_state.thread_id] = st.session_state.messages
 
 with st.sidebar:
     if st.button("+ New Conversation"):
