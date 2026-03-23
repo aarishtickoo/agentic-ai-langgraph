@@ -9,3 +9,5 @@ langchain-community==0.4.1
 ddgs==9.11.4
 langchain-tavily==0.2.17
 wikipedia==1.4.0
+langchain-mcp-adapters==0.2.2
+aiosqlite==0.22.1
