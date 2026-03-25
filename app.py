@@ -1,24 +1,117 @@
 import os
 import requests
 import asyncio
-from typing import Annotated, TypedDict
+import tempfile
+from typing import Annotated, TypedDict, Any
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, add_messages
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langchain_tavily import TavilySearch
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_tavily import TavilySearch
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain.tools import tool, ToolRuntime
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 load_dotenv(override=True)
 
 MODEL_DEFAULT = "gemini-2.5-flash"
-llm = ChatGoogleGenerativeAI(model=MODEL_DEFAULT)
+EMBEDDING_MODEL_DEFAULT="gemini-embedding-2-preview"
 
+llm = ChatGoogleGenerativeAI(model=MODEL_DEFAULT)
+embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL_DEFAULT)
+
+class ThreadRAGEntry(TypedDict):
+    retriever: Any
+    filename: str
+    num_documents: int
+    num_chunks: int
+
+_THREAD_RAG_STORE: dict[str, ThreadRAGEntry] = {}
+
+
+def ingest_pdf_sync(file_bytes: bytes, thread_id: str, filename: str) -> dict:
+    if not file_bytes:
+        raise ValueError("No PDF bytes received.")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", " ", ""],
+        )
+        chunks = splitter.split_documents(docs)
+
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": 3},
+        )
+
+        _THREAD_RAG_STORE[thread_id] = {
+            "retriever": retriever,
+            "filename": filename,
+            "num_documents": len(docs),
+            "num_chunks": len(chunks),
+        }
+
+        return {
+            "filename": filename,
+            "documents": len(docs),
+            "chunks": len(chunks),
+        }
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+async def ingest_pdf(file_bytes: bytes, thread_id: str, filename: str) -> dict:
+    # heavy blocking work moved off the event loop
+    return await asyncio.to_thread(
+        ingest_pdf_sync,
+        file_bytes,
+        thread_id,
+        filename,
+    )
+
+
+@tool
+def pdf_rag(query: str, runtime: ToolRuntime) -> dict:
+    """
+    Retrieve relevant context from the uploaded PDF for the current chat thread.
+    Use this when the user asks about the uploaded document.
+    """
+    thread_id = runtime.state["thread_id"]
+    retriever = _THREAD_RAG_STORE[thread_id]["retriever"]
+
+    if retriever is None:
+        return {
+            "error": "No PDF has been indexed for this thread yet.",
+            "query": query,
+        }
+
+    docs = retriever.invoke(query)
+
+    return {
+        "query": query,
+        "source_file": _THREAD_RAG_STORE[thread_id]["filename"],
+        "context": [doc.page_content for doc in docs],
+        "metadata": [doc.metadata for doc in docs],
+    }
 
 @tool
 def get_weather(city: str) -> str:
@@ -68,7 +161,7 @@ wiki_tool = WikipediaQueryRun(
     api_wrapper=WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=1000)
 )
 
-local_tools = [get_weather, get_exchange_rate, search_tool, wiki_tool]
+local_tools = [get_weather, get_exchange_rate, search_tool, wiki_tool, pdf_rag]
 
 
 async def load_mcp_tools():
@@ -93,19 +186,27 @@ async def load_mcp_tools():
 
 class ChatBotState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-
+    thread_id: str
 
 async def build_app(memory):
     mcp_tools = await load_mcp_tools()
-    print(f"{len(mcp_tools)} MCP tools loaded")
-    for t in mcp_tools[:3]:
-        print(t.name)
 
     tools = local_tools + mcp_tools
     llm_with_tools = llm.bind_tools(tools)
 
     async def chat_node(state: ChatBotState) -> dict:
-        response = await llm_with_tools.ainvoke(state["messages"])
+        system_message = SystemMessage(
+            content=(
+                "You are a helpful assistant. "
+                "If the user's question is about an uploaded PDF or document, use the "
+                "`pdf_rag` tool first. "
+                "Use web/wiki/MCP tools only when they are more appropriate."
+            )
+        )
+
+        response = await llm_with_tools.ainvoke(
+            [system_message, *state["messages"]]
+        )
         return {"messages": [response]}
 
     tool_node = ToolNode(tools)
@@ -120,7 +221,6 @@ async def build_app(memory):
         .compile(checkpointer=memory)
     )
     return app
-
 def extract_ai_text(message) -> str:
     content = message.content
 
@@ -136,6 +236,7 @@ def extract_ai_text(message) -> str:
 
     return str(content)
 
+
 async def main():
     async with AsyncSqliteSaver.from_conn_string("conversations.db") as memory:
         app = await build_app(memory)
@@ -143,18 +244,46 @@ async def main():
         from uuid import uuid4
         thread_id = str(uuid4())
         print(f"thread_id: {thread_id}")
+        print("Use: /pdf /absolute/path/to/file.pdf")
+        print("Then ask questions about that PDF.")
 
         while True:
             user_message = input("Type here: ").strip()
+
             if user_message.lower() in ["exit", "quit", "bye", ""]:
                 print("Breaking out of loop")
                 break
 
+            if user_message.startswith("/pdf "):
+                pdf_path = user_message[len("/pdf "):].strip()
+
+                if not os.path.exists(pdf_path):
+                    print("PDF path does not exist.")
+                    continue
+
+                with open(pdf_path, "rb") as f:
+                    summary = await ingest_pdf(
+                        file_bytes=f.read(),
+                        thread_id=thread_id,
+                        filename=os.path.basename(pdf_path),
+                    )
+
+                print(
+                    f"Indexed PDF: {summary['filename']} | "
+                    f"pages={summary['documents']} | chunks={summary['chunks']}"
+                )
+                continue
+
             config = {"configurable": {"thread_id": thread_id}}
+
             response = await app.ainvoke(
-                {"messages": [HumanMessage(content=user_message)]},
+                {
+                    "messages": [HumanMessage(content=user_message)],
+                    "thread_id": thread_id,
+                },
                 config=config,
             )
+
             print("AI:", extract_ai_text(response["messages"][-1]))
 
 
